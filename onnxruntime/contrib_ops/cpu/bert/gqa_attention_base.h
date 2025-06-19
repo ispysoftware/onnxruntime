@@ -35,6 +35,8 @@ class GQAAttentionBase {
     use_smooth_softmax_ = info.GetAttrOrDefault<int64_t>("smooth_softmax", 0) == 1;
 
     local_window_size_ = has_local ? static_cast<int>(info.GetAttrOrDefault<int64_t>("local_window_size", -1)) : -1;
+
+    output_post_softmax_qk_ = static_cast<int>(info.GetAttrOrDefault<int64_t>("output_post_softmax_qk", -1));
   }
 
   int num_heads_;     // number of attention heads of Q
@@ -44,6 +46,7 @@ class GQAAttentionBase {
   bool do_rotary_;  // whether or not to use rotary embeddings
   bool rotary_interleaved_;
   int local_window_size_;
+  int output_post_softmax_qk_;
 
   bool use_smooth_softmax_;
 
@@ -57,6 +60,7 @@ class GQAAttentionBase {
                         Tensor* output,                             // output tensor
                         Tensor* present_key,                        // present K output tensor (if separating present KV)
                         Tensor* present_value,                      // present V output tensor (if separating present KV)
+                        Tensor* output_qk,                          // output QK buffer
                         const Tensor* seqlens_k,                    // past sequence lengths tensor
                         GroupQueryAttentionParameters& parameters,  // attention parameters
                         AllocatorPtr allocator,                     // allocator for temporary tensors
@@ -79,8 +83,7 @@ class GQAAttentionBase {
     // Compute the attention score.
     bool gqa_mlas_supported = MlasGQASupported<T>(CblasNoTrans, CblasTrans) &&
                               MlasGQASupported<T>(CblasNoTrans, CblasNoTrans);
-    size_t bytes = SafeInt<size_t>(batch_size) * num_heads_ * sequence_length * seqlen_present_kv_cache *
-                   (gqa_mlas_supported ? sizeof(T) : sizeof(float));
+    size_t bytes = SafeInt<size_t>(batch_size) * num_heads_ * sequence_length * seqlen_present_kv_cache * (gqa_mlas_supported ? sizeof(T) : sizeof(float));
     auto attention_probs = allocator->Alloc(bytes);
     BufferUniquePtr scratch_buffer(attention_probs, BufferDeleter(allocator));
 
@@ -96,11 +99,13 @@ class GQAAttentionBase {
 
     const T* k = packed_qkv ? Q + num_heads_ * sequence_length * head_size : K;
 
+    T* output_qk_buffer = output_qk != nullptr ? output_qk->MutableData<T>() : nullptr;
+
     if (gqa_mlas_supported) {
       ComputeAttentionProbs(static_cast<T*>(attention_probs), Q, k, seqlens_k->Data<int32_t>(), attention_bias_data,
                             batch_size, sequence_length, attention_bias_shape, seqlen_past_kv_cache, seqlen_present_kv_cache,
                             head_size, past_key_data, present_key_data, past_present_share_buffer, packed_qkv, is_prompt,
-                            tp, allocator);
+                            output_qk_buffer, tp, allocator);
 
       // Compute the attentionScore * Value: out(B, N, S, H_v) = attention_probs(B, N, S, T) x V(B, N, T, H_v)
       const T* v = packed_qkv ? Q + (num_heads_ + kv_num_heads_) * sequence_length * head_size : V;
@@ -113,7 +118,7 @@ class GQAAttentionBase {
       ComputeAttentionProbs(static_cast<float*>(attention_probs), Q, k, seqlens_k->Data<int32_t>(), attention_bias_data,
                             batch_size, sequence_length, attention_bias_shape, seqlen_past_kv_cache, seqlen_present_kv_cache,
                             head_size, past_key_data, present_key_data, past_present_share_buffer, packed_qkv, is_prompt,
-                            tp, allocator);
+                            output_qk_buffer, tp, allocator);
 
       // Compute the attentionScore * Value: out(B, N, S, H_v) = attention_probs(B, N, S, T) x V(B, N, T, H_v)
       const T* v = packed_qkv ? Q + (num_heads_ + kv_num_heads_) * sequence_length * head_size : V;
@@ -149,8 +154,9 @@ class GQAAttentionBase {
                              const bool past_present_share_buffer,                 // whether present key and value share the same buffer
                              const bool packed_qkv,                                // whether Q, K, V are packed
                              const bool is_prompt,                                 // whether it is prompt
-                             ThreadPool* tp,                                       // thread pool
-                             AllocatorPtr allocator) const {                       // allocator for temporary buffer
+                             T* output_qk,
+                             ThreadPool* tp,                  // thread pool
+                             AllocatorPtr allocator) const {  // allocator for temporary buffer
     const ptrdiff_t packed_batch_stride =
         packed_qkv ? SafeInt<ptrdiff_t>(num_heads_ + 2 * kv_num_heads_) * sequence_length * head_size
                    : SafeInt<ptrdiff_t>(0);
@@ -197,6 +203,11 @@ class GQAAttentionBase {
 
         const ptrdiff_t output_offset = SafeInt<ptrdiff_t>(i) * sequence_length * present_buffer_sequence_length;
         U* output = attention_probs + output_offset;
+        T* output_qk_thread = nullptr;
+        if (output_qk != nullptr) {
+          const ptrdiff_t output_qk_offset = SafeInt<ptrdiff_t>(sequence_length) * present_buffer_sequence_length * (batch_index * num_heads_ + head_index);
+          output_qk_thread = output_qk + output_qk_offset;
+        }
 
         // Compute attention bias offset based on the batch and head indexes
         // Attention bias is of shape (B or 1, H or 1, S, T) so handle broadcasting
@@ -310,12 +321,6 @@ class GQAAttentionBase {
             }
           }
 
-          if (use_smooth_softmax_) {
-            ComputeSmoothSoftmaxInplace(output_softmax + start_offset, 1, static_cast<int>(window_size), nullptr);
-          } else {
-            ComputeAttentionSoftmaxInplace(output_softmax + start_offset, 1, static_cast<int>(window_size), nullptr);
-          }
-
           // set causal [seq_causal_length, total_seqlen) to 0.f
           for (size_t total_seq_id = seq_causal_length; total_seq_id < total_seqlen; total_seq_id++) {
             if constexpr (std::is_same<U, float>::value) {
@@ -325,11 +330,31 @@ class GQAAttentionBase {
             }
           }
 
+          // Only write output for current token being processed
+          if (output_post_softmax_qk_ == 0) {
+            T* output_qk_thread_seq = nullptr;
+            if (output_qk_thread != nullptr) {
+              const ptrdiff_t qk_seq_offset = SafeInt<ptrdiff_t>(seq) * present_buffer_sequence_length;
+              output_qk_thread_seq = output_qk_thread + qk_seq_offset;
+            }
+            WriteOutputQKHeadChunk(output_qk_thread_seq, output_softmax, 1 /* sequence_length */, present_buffer_sequence_length);
+          }
+
+          if (use_smooth_softmax_) {
+            ComputeSmoothSoftmaxInplace(output_softmax + start_offset, 1, static_cast<int>(window_size), nullptr);
+          } else {
+            ComputeAttentionSoftmaxInplace(output_softmax + start_offset, 1, static_cast<int>(window_size), nullptr);
+          }
+
           output_softmax += present_buffer_sequence_length;
 
           if (attention_bias_thread != nullptr) {
             attention_bias_thread += attention_total_seqlen;
           }
+        }
+
+        if (output_post_softmax_qk_ == 1) {
+          WriteOutputQKHeadChunk(output_qk_thread, output, sequence_length, present_buffer_sequence_length);
         }
       }
     });
@@ -453,6 +478,21 @@ class GQAAttentionBase {
       MlasConvertFloatToHalfBuffer(static_cast<float*>(output_fp32),
                                    output,
                                    SafeInt<size_t>(sequence_length) * batch_size * num_heads_ * head_size);
+    }
+  }
+
+  template <typename T, typename U>
+  void WriteOutputQKHeadChunk(T* output_qk, const U* attention_probs, size_t sequence_length, size_t seqlen_present_kv_cache) const {
+    if (output_qk == nullptr) {
+      return;
+    }
+
+    const size_t head_elements_count = SafeInt<size_t>(sequence_length) * seqlen_present_kv_cache;
+    if constexpr (std::is_same_v<U, T>) {
+      std::memcpy(output_qk, attention_probs, SafeInt<size_t>(head_elements_count) * sizeof(T));
+    } else {
+      static_assert(std::is_same_v<U, float> && std::is_same_v<T, MLFloat16>);
+      MlasConvertFloatToHalfBuffer(static_cast<const float*>(attention_probs), output_qk, head_elements_count);
     }
   }
 };

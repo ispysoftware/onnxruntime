@@ -54,6 +54,7 @@ class Config:
     head_size: int = 0
     has_position_ids: bool = False
     has_attention_bias: bool = False
+    output_post_softmax_qk: int = -1
 
 
 @dataclass
@@ -67,6 +68,7 @@ class PromptConfig:
     head_size: int = 0
     has_position_ids: bool = False
     has_attention_bias: bool = False
+    output_post_softmax_qk: int = -1
 
 
 # LLaMA Microsoft model
@@ -167,7 +169,7 @@ def create_group_query_attention_graph_prompt(
                 "position_ids" if config.has_position_ids else "",
                 "attention_bias" if config.has_attention_bias else "",
             ],
-            ["output", "present_key", "present_value"],
+            ["output", "present_key", "present_value", "output_qk" if config.output_post_softmax_qk >= 0 else ""],
             "GroupQueryAttention_0",
             num_heads=config.num_heads,
             kv_num_heads=config.kv_num_heads,
@@ -176,6 +178,7 @@ def create_group_query_attention_graph_prompt(
             rotary_interleaved=rotary_interleaved,
             softcap=softcap,
             smooth_softmax=1 if use_smooth_softmax else 0,
+            output_post_softmax_qk=config.output_post_softmax_qk,
             # is_past_bsnh=1 if past_kv_format == Formats.BSNH else 0,
             # kv_share_buffer=1 if share_buffer else 0,
             domain="com.microsoft",
@@ -337,6 +340,15 @@ def create_group_query_attention_graph_prompt(
         ),
     ]
 
+    if config.output_post_softmax_qk >= 0:
+        graph_output += [
+            helper.make_tensor_value_info(
+                "output_qk",
+                ort_type,
+                [config.batch_size, config.num_heads, config.kv_sequence_length, present_kv_seqlen],
+            ),
+        ]
+
     graph = helper.make_graph(
         nodes,
         "GroupQueryAttention_Graph",
@@ -381,7 +393,7 @@ def create_group_query_attention_graph_past(
                 "position_ids" if config.has_position_ids else "",
                 "attention_bias" if config.has_attention_bias else "",
             ],
-            ["output", "present_key", "present_value"],
+            ["output", "present_key", "present_value", "output_qk" if config.output_post_softmax_qk >= 0 else ""],
             "GroupQueryAttention_0",
             num_heads=config.num_heads,
             kv_num_heads=config.kv_num_heads,
@@ -390,6 +402,7 @@ def create_group_query_attention_graph_past(
             rotary_interleaved=rotary_interleaved,
             softcap=softcap,
             smooth_softmax=1 if use_smooth_softmax else 0,
+            output_post_softmax_qk=config.output_post_softmax_qk,
             # is_past_bsnh=1 if past_kv_format == Formats.BSNH else 0,
             # kv_share_buffer=1 if share_buffer else 0,
             domain="com.microsoft",
@@ -525,6 +538,15 @@ def create_group_query_attention_graph_past(
             ],
         ),
     ]
+
+    if config.output_post_softmax_qk >= 0:
+        graph_output += [
+            helper.make_tensor_value_info(
+                "output_qk",
+                ort_type,
+                [config.batch_size, config.num_heads, config.sequence_length, present_kv_seqlen],
+            ),
+        ]
 
     graph = helper.make_graph(
         nodes,
@@ -714,6 +736,7 @@ def gqa_prompt_func(
     seqlens_k=None,
     position_ids=None,
     attention_bias=None,
+    output_qk=None,
     window_size=-1,
     past_kv_format=Formats.BSNH,
     share_buffer=True,
@@ -746,6 +769,8 @@ def gqa_prompt_func(
     if config.has_attention_bias:
         assert attention_bias is not None
 
+    out_qk = None
+
     if new_k is not None:
         new_k = torch.reshape(new_k, (config.batch_size, config.kv_sequence_length, -1))
         new_v = torch.reshape(new_v, (config.batch_size, config.kv_sequence_length, -1))
@@ -757,7 +782,7 @@ def gqa_prompt_func(
             "seqlens_k": seqlens_k.detach().cpu().numpy().astype(numpy.int32),
             "total_sequence_length": torch.tensor([config.q_sequence_length], dtype=torch.int32).detach().cpu().numpy(),
         }
-
+        ort_outputs = {}
         sess_options = SessionOptions()
         ort_session = InferenceSession(onnx_model_str, sess_options, providers=["CPUExecutionProvider"])
         io_binding = ort_session.io_binding()
@@ -797,17 +822,24 @@ def gqa_prompt_func(
         io_binding.bind_output("output")
         io_binding.bind_ortvalue_output("present_key", ort_inputs["past_key"])
         io_binding.bind_ortvalue_output("present_value", ort_inputs["past_value"])
+        if config.output_post_softmax_qk >= 0:
+            ort_outputs["output_qk"] = OrtValue.ortvalue_from_numpy(output_qk.detach().cpu().numpy(), "cpu", 0)
+            io_binding.bind_ortvalue_output("output_qk", ort_outputs["output_qk"])
         ort_session.run_with_iobinding(io_binding)
-        ort_output, present_k, present_v = io_binding.copy_outputs_to_cpu()
+        if config.output_post_softmax_qk >= 0:
+            ort_output, present_k, present_v, out_qk = io_binding.copy_outputs_to_cpu()
+        else:
+            ort_output, present_k, present_v = io_binding.copy_outputs_to_cpu()
         ort_output = numpy.array(ort_output)
         output = torch.tensor(ort_output)
-        return output, present_k, present_v
+        return output, present_k, present_v, out_qk
     else:
         ort_inputs = {
             "query": q.detach().cpu().numpy(),
             "seqlens_k": seqlens_k.detach().cpu().numpy().astype(numpy.int32),
             "total_sequence_length": torch.tensor([config.q_sequence_length], dtype=torch.int32).detach().cpu().numpy(),
         }
+        ort_outputs = {}
         sess_options = SessionOptions()
         ort_session = InferenceSession(onnx_model_str, sess_options, providers=["CPUExecutionProvider"])
         io_binding = ort_session.io_binding()
@@ -836,11 +868,17 @@ def gqa_prompt_func(
         io_binding.bind_output("output")
         io_binding.bind_output("present_key")
         io_binding.bind_output("present_value")
+        if config.output_post_softmax_qk >= 0:
+            ort_outputs["output_qk"] = OrtValue.ortvalue_from_numpy(output_qk.detach().cpu().numpy(), "cpu", 0)
+            io_binding.bind_ortvalue_output("output_qk", ort_outputs["output_qk"])
         ort_session.run_with_iobinding(io_binding)
-        ort_output, present_k, present_v = io_binding.copy_outputs_to_cpu()
+        if config.output_post_softmax_qk >= 0:
+            ort_output, present_k, present_v, out_qk = io_binding.copy_outputs_to_cpu()
+        else:
+            ort_output, present_k, present_v = io_binding.copy_outputs_to_cpu()
         ort_output = numpy.array(ort_output)
         output = torch.tensor(ort_output)
-        return output, present_k, present_v
+        return output, present_k, present_v, out_qk
 
 
 def gqa_past_func(
@@ -855,6 +893,7 @@ def gqa_past_func(
     seqlens_k=None,
     position_ids=None,
     attention_bias=None,
+    output_qk=None,
     past_kv_format=Formats.BSNH,
     share_buffer=True,
     window_size=-1,
@@ -887,6 +926,8 @@ def gqa_past_func(
     if config.has_attention_bias:
         assert attention_bias is not None
 
+    out_qk = None
+
     if new_k is not None:
         new_k = torch.reshape(new_k, (config.batch_size, config.sequence_length, -1))
         new_v = torch.reshape(new_v, (config.batch_size, config.sequence_length, -1))
@@ -901,6 +942,7 @@ def gqa_past_func(
             .cpu()
             .numpy(),
         }
+        ort_outputs = {}
         sess_options = SessionOptions()
         ort_session = InferenceSession(onnx_model_str, sess_options, providers=["CPUExecutionProvider"])
         io_binding = ort_session.io_binding()
@@ -940,11 +982,17 @@ def gqa_past_func(
         io_binding.bind_output("output")
         io_binding.bind_ortvalue_output("present_key", ort_inputs["past_key"])
         io_binding.bind_ortvalue_output("present_value", ort_inputs["past_value"])
+        if config.output_post_softmax_qk >= 0:
+            ort_outputs["output_qk"] = OrtValue.ortvalue_from_numpy(output_qk.detach().cpu().numpy(), "cpu", 0)
+            io_binding.bind_ortvalue_output("output_qk", ort_outputs["output_qk"])
         ort_session.run_with_iobinding(io_binding)
-        ort_output, present_k, present_v = io_binding.copy_outputs_to_cpu()
+        if config.output_post_softmax_qk >= 0:
+            ort_output, present_k, present_v, out_qk = io_binding.copy_outputs_to_cpu()
+        else:
+            ort_output, present_k, present_v = io_binding.copy_outputs_to_cpu()
         ort_output = numpy.array(ort_output)
         output = torch.tensor(ort_output)
-        return output, present_k, present_v
+        return output, present_k, present_v, out_qk
     else:
         ort_inputs = {
             "query": q.detach().cpu().numpy(),
@@ -958,6 +1006,7 @@ def gqa_past_func(
             .cpu()
             .numpy(),
         }
+        ort_outputs = {}
         sess_options = SessionOptions()
         ort_session = InferenceSession(onnx_model_str, sess_options, providers=["CPUExecutionProvider"])
         io_binding = ort_session.io_binding()
@@ -988,11 +1037,17 @@ def gqa_past_func(
         io_binding.bind_output("output")
         io_binding.bind_output("present_key")
         io_binding.bind_output("present_value")
+        if config.output_post_softmax_qk >= 0:
+            ort_outputs["output_qk"] = OrtValue.ortvalue_from_numpy(output_qk.detach().cpu().numpy(), "cpu", 0)
+            io_binding.bind_ortvalue_output("output_qk", ort_outputs["output_qk"])
         ort_session.run_with_iobinding(io_binding)
-        ort_output, present_k, present_v = io_binding.copy_outputs_to_cpu()
+        if config.output_post_softmax_qk >= 0:
+            ort_output, present_k, present_v, out_qk = io_binding.copy_outputs_to_cpu()
+        else:
+            ort_output, present_k, present_v = io_binding.copy_outputs_to_cpu()
         ort_output = numpy.array(ort_output)
         output = torch.tensor(ort_output)
-        return output, present_k, present_v
+        return output, present_k, present_v, out_qk
 
 
 def construct_causal_mask(seqlen_q, seqlen_k, query_padding_mask=None, key_padding_mask=None, device=None):
@@ -1066,6 +1121,7 @@ def attention_ref(
         use_smooth_softmax: whether use smooth softmax or not
     Output:
         output: (batch_size, seqlen_q, nheads, head_dim)
+        masked_scores: (batch_size, nheads, seqlen_q, seqlen_k), before softmax
         attention: (batch_size, nheads, seqlen_q, seqlen_k), softmax after dropout
     """
     if causal:
@@ -1096,6 +1152,8 @@ def attention_ref(
             key_padding_mask,
             q.device,
         )
+        masked_scores = scores.clone()
+        masked_scores.masked_fill_(local_mask, 0.0)
         scores.masked_fill_(local_mask, float("-inf"))
 
     if use_smooth_softmax:
@@ -1121,7 +1179,7 @@ def attention_ref(
     if query_padding_mask is not None:
         output.masked_fill_(rearrange(~query_padding_mask, "b s -> b s 1 1"), 0.0)
 
-    return output.to(dtype=dtype_og), attention.to(dtype=dtype_og)
+    return output.to(dtype=dtype_og), masked_scores.to(dtype=dtype_og), attention.to(dtype=dtype_og)
 
 
 def attention_qkvpacked_ref(
@@ -1305,6 +1363,20 @@ def parity_check_gqa_prompt(
         else None
     )
 
+    output_qk = (
+        torch.zeros(
+            config.batch_size,
+            config.num_heads,
+            config.kv_sequence_length,
+            config.buffer_sequence_length,
+            device="cpu",
+            dtype=torch_type,
+            requires_grad=False,
+        )
+        if config.output_post_softmax_qk >= 0
+        else None
+    )
+
     arange = rearrange(torch.arange(config.buffer_sequence_length, device="cpu"), "s -> 1 s")
     cache_seqlens_expanded = rearrange(cache_seqlens, "b -> b 1")
     kv_seqlens = torch.tensor([config.kv_sequence_length], device="cpu").repeat(config.batch_size)
@@ -1315,7 +1387,7 @@ def parity_check_gqa_prompt(
     k_cache_rep = repeat(k_cache_ref, "b s h d -> b s (h g) d", g=config.num_heads // config.kv_num_heads)
     v_cache_rep = repeat(v_cache_ref, "b s h d -> b s (h g) d", g=config.num_heads // config.kv_num_heads)
     key_padding_mask = arange < cache_seqlens_expanded
-    out_ref, _ = attention_ref(
+    out_ref, out_qk_pre_softmax_ref, out_qk_post_softmax_ref = attention_ref(
         q_ro,
         k_cache_rep,
         v_cache_rep,
@@ -1337,7 +1409,7 @@ def parity_check_gqa_prompt(
     # Cache seqlens is reduced by 1 since it is required to be past_seq_len + seq_len - 1
     if packed:
         packed_qkv = torch.concatenate([q, new_k, new_v], dim=2)
-        out, present_k, present_v = gqa_prompt_func(
+        out, present_k, present_v, out_qk = gqa_prompt_func(
             packed_qkv,
             k,
             v,
@@ -1349,6 +1421,7 @@ def parity_check_gqa_prompt(
             cache_seqlens - 1,
             position_ids,
             attention_bias,
+            output_qk,
             left_window_size,
             past_format,
             True,
@@ -1359,7 +1432,7 @@ def parity_check_gqa_prompt(
             numpy_type=numpy_type,
         )
     else:
-        out, present_k, present_v = gqa_prompt_func(
+        out, present_k, present_v, out_qk = gqa_prompt_func(
             q,
             k,
             v,
@@ -1371,6 +1444,7 @@ def parity_check_gqa_prompt(
             cache_seqlens - 1,
             position_ids,
             attention_bias,
+            output_qk,
             left_window_size,
             past_format,
             True,
@@ -1383,6 +1457,20 @@ def parity_check_gqa_prompt(
     out = torch.squeeze(out, 0)
     out = torch.reshape(out, (config.batch_size, config.q_sequence_length, config.num_heads, config.head_size))
     out = out.detach().cpu().numpy()
+
+    if config.output_post_softmax_qk >= 0:
+        out_qk_ref = out_qk_post_softmax_ref if config.output_post_softmax_qk == 1 else out_qk_pre_softmax_ref
+        out_qk_ref = out_qk_ref.detach().cpu().numpy()
+
+        for batch_idx in range(config.batch_size):
+            total_seqlen = cache_seqlens[batch_idx] + 1
+            assert numpy.allclose(
+                out_qk[batch_idx, :, :, :total_seqlen],
+                out_qk_ref[batch_idx, :, :, :total_seqlen],
+                rtol=rtol,
+                atol=atol,
+                equal_nan=True,
+            )
 
     # Make sure past-present buffer updating correctly
     assert numpy.allclose(present_k, k_cache_ref.detach().cpu().numpy(), rtol=rtol, atol=atol, equal_nan=True)
@@ -1425,6 +1513,8 @@ def parity_check_gqa_prompt(
         config.has_position_ids,
         " has_attention_bias:",
         config.has_attention_bias,
+        " output_post_softmax_qk:",
+        config.output_post_softmax_qk,
         " Mean Error:",
         numpy.mean(numpy.abs(out - out_ref)),
         correct,
@@ -1531,12 +1621,26 @@ def parity_check_gqa_prompt_no_buff(
         else None
     )
 
+    output_qk = (
+        torch.zeros(
+            config.batch_size,
+            config.num_heads,
+            config.kv_sequence_length,
+            config.q_sequence_length,
+            device="cpu",
+            dtype=torch_type,
+            requires_grad=False,
+        )
+        if config.output_post_softmax_qk >= 0
+        else None
+    )
+
     brange = rearrange(torch.arange(config.kv_sequence_length, device="cpu"), "s -> 1 s")
     cache_seqlens_expanded = rearrange(cache_seqlens, "b -> b 1")
     new_mask = brange < cache_seqlens_expanded
     k_cache_rep = repeat(k_cache_ref, "b s h d -> b s (h g) d", g=config.num_heads // config.kv_num_heads)
     v_cache_rep = repeat(v_cache_ref, "b s h d -> b s (h g) d", g=config.num_heads // config.kv_num_heads)
-    out_ref, _ = attention_ref(
+    out_ref, out_qk_pre_softmax_ref, out_qk_post_softmax_ref = attention_ref(
         q_ro,
         k_cache_rep,
         v_cache_rep,
@@ -1558,7 +1662,7 @@ def parity_check_gqa_prompt_no_buff(
     # Cache seqlens is reduced by 1 since it is required to be past_seq_len + seq_len - 1
     if packed:
         packed_qkv = torch.concatenate([q, new_k, new_v], dim=2)
-        out, present_k, present_v = gqa_prompt_func(
+        out, present_k, present_v, out_qk = gqa_prompt_func(
             packed_qkv,
             None,
             None,
@@ -1570,6 +1674,7 @@ def parity_check_gqa_prompt_no_buff(
             cache_seqlens - 1,
             position_ids,
             attention_bias,
+            output_qk,
             left_window_size,
             past_format,
             False,
@@ -1580,7 +1685,7 @@ def parity_check_gqa_prompt_no_buff(
             numpy_type=numpy_type,
         )
     else:
-        out, present_k, present_v = gqa_prompt_func(
+        out, present_k, present_v, out_qk = gqa_prompt_func(
             q,
             None,
             None,
@@ -1592,6 +1697,7 @@ def parity_check_gqa_prompt_no_buff(
             cache_seqlens - 1,
             position_ids,
             attention_bias,
+            output_qk,
             left_window_size,
             past_format,
             False,
@@ -1604,6 +1710,20 @@ def parity_check_gqa_prompt_no_buff(
     out = torch.squeeze(out, 0)
     out = torch.reshape(out, (config.batch_size, config.q_sequence_length, config.num_heads, config.head_size))
     out = out.detach().cpu().numpy()
+
+    if config.output_post_softmax_qk >= 0:
+        out_qk_ref = out_qk_post_softmax_ref if config.output_post_softmax_qk == 1 else out_qk_pre_softmax_ref
+        out_qk_ref = out_qk_ref.detach().cpu().numpy()
+
+        for batch_idx in range(config.batch_size):
+            total_seqlen = cache_seqlens[batch_idx] + 1
+            assert numpy.allclose(
+                out_qk[batch_idx, :, :, :total_seqlen],
+                out_qk_ref[batch_idx, :, :, :total_seqlen],
+                rtol=rtol,
+                atol=atol,
+                equal_nan=True,
+            )
 
     # Make sure past-present buffer updating correctly
     assert numpy.allclose(present_k, k_cache_ref.detach().cpu().numpy(), rtol=rtol, atol=atol, equal_nan=True)
@@ -1646,6 +1766,8 @@ def parity_check_gqa_prompt_no_buff(
         config.has_position_ids,
         " has_attention_bias:",
         config.has_attention_bias,
+        " output_post_softmax_qk:",
+        config.output_post_softmax_qk,
         " Mean Error:",
         numpy.mean(numpy.abs(out - out_ref)),
         correct,
@@ -1769,7 +1891,7 @@ def parity_check_gqa_past(
     k_cache_rep = repeat(k_cache_ref, "b s h d -> b s (h g) d", g=config.num_heads // config.kv_num_heads)
     v_cache_rep = repeat(v_cache_ref, "b s h d -> b s (h g) d", g=config.num_heads // config.kv_num_heads)
     key_padding_mask = arange < cache_seqlens_expanded + config.sequence_length
-    out_ref, _ = attention_ref(
+    out_ref, out_qk_pre_softmax_ref, out_qk_post_softmax_ref = attention_ref(
         q_ro,
         k_cache_rep,
         v_cache_rep,
@@ -1807,10 +1929,24 @@ def parity_check_gqa_past(
         else None
     )
 
+    output_qk = (
+        torch.zeros(
+            config.batch_size,
+            config.num_heads,
+            config.sequence_length,
+            config.kv_sequence_length,
+            device="cpu",
+            dtype=torch_type,
+            requires_grad=False,
+        )
+        if config.output_post_softmax_qk >= 0
+        else None
+    )
+
     # ORT function
     if packed:
         packed_qkv = torch.concatenate([q, new_k, new_v], dim=2)
-        out, present_k, present_v = gqa_past_func(
+        out, present_k, present_v, out_qk = gqa_past_func(
             packed_qkv,
             k,
             v,
@@ -1822,6 +1958,7 @@ def parity_check_gqa_past(
             cache_seqlens,
             position_ids,
             attention_bias,
+            output_qk,
             past_format,
             True,
             left_window_size,
@@ -1832,7 +1969,7 @@ def parity_check_gqa_past(
             numpy_type=numpy_type,
         )
     else:
-        out, present_k, present_v = gqa_past_func(
+        out, present_k, present_v, out_qk = gqa_past_func(
             q,
             k,
             v,
@@ -1844,6 +1981,7 @@ def parity_check_gqa_past(
             cache_seqlens,
             position_ids,
             attention_bias,
+            output_qk,
             past_format,
             True,
             left_window_size,
@@ -1856,6 +1994,20 @@ def parity_check_gqa_past(
     out = torch.squeeze(out, 0)
     out = torch.reshape(out, (config.batch_size, config.sequence_length, config.num_heads, config.head_size))
     out = out.detach().cpu().numpy()
+
+    if config.output_post_softmax_qk >= 0:
+        out_qk_ref = out_qk_post_softmax_ref if config.output_post_softmax_qk == 1 else out_qk_pre_softmax_ref
+        out_qk_ref = out_qk_ref.detach().cpu().numpy()
+
+        for batch_idx in range(config.batch_size):
+            total_seqlen = cache_seqlens[batch_idx] + 1
+            assert numpy.allclose(
+                out_qk[batch_idx, :, :, :total_seqlen],
+                out_qk_ref[batch_idx, :, :, :total_seqlen],
+                rtol=rtol,
+                atol=atol,
+                equal_nan=True,
+            )
 
     # Make sure past-present buffer updating correctly
     assert numpy.allclose(present_k, k_cache_ref.detach().cpu().numpy(), rtol=rtol, atol=atol, equal_nan=True)
@@ -1898,6 +2050,8 @@ def parity_check_gqa_past(
         config.has_position_ids,
         " has_attention_bias:",
         config.has_attention_bias,
+        " output_post_softmax_qk:",
+        config.output_post_softmax_qk,
         " Mean Error:",
         numpy.mean(numpy.abs(out - out_ref)),
         correct,
@@ -2027,7 +2181,7 @@ def parity_check_gqa_past_no_buff(
     k_cache_rep = repeat(k_cache_ref, "b s h d -> b s (h g) d", g=config.num_heads // config.kv_num_heads)
     v_cache_rep = repeat(v_cache_ref, "b s h d -> b s (h g) d", g=config.num_heads // config.kv_num_heads)
     key_padding_mask = arange < cache_seqlens_expanded + config.sequence_length
-    out_ref, _ = attention_ref(
+    out_ref, out_qk_pre_softmax_ref, out_qk_post_softmax_ref = attention_ref(
         q_ro,
         k_cache_rep,
         v_cache_rep,
@@ -2065,10 +2219,24 @@ def parity_check_gqa_past_no_buff(
         else None
     )
 
+    output_qk = (
+        torch.zeros(
+            config.batch_size,
+            config.num_heads,
+            config.sequence_length,
+            config.kv_sequence_length + config.sequence_length,
+            device="cpu",
+            dtype=torch_type,
+            requires_grad=False,
+        )
+        if config.output_post_softmax_qk >= 0
+        else None
+    )
+
     # Flash function
     if packed:
         packed_qkv = torch.concatenate([q, new_k, new_v], dim=2)
-        out, present_k, present_v = gqa_past_func(
+        out, present_k, present_v, out_qk = gqa_past_func(
             packed_qkv,
             k,
             v,
@@ -2080,6 +2248,7 @@ def parity_check_gqa_past_no_buff(
             cache_seqlens,
             position_ids,
             attention_bias,
+            output_qk,
             past_format,
             False,
             window_size=left_window_size,
@@ -2090,7 +2259,7 @@ def parity_check_gqa_past_no_buff(
             numpy_type=numpy_type,
         )
     else:
-        out, present_k, present_v = gqa_past_func(
+        out, present_k, present_v, out_qk = gqa_past_func(
             q,
             k,
             v,
@@ -2102,6 +2271,7 @@ def parity_check_gqa_past_no_buff(
             cache_seqlens,
             position_ids,
             attention_bias,
+            output_qk,
             past_format,
             False,
             window_size=left_window_size,
@@ -2114,6 +2284,20 @@ def parity_check_gqa_past_no_buff(
     out = torch.squeeze(out, 0)
     out = torch.reshape(out, (config.batch_size, config.sequence_length, config.num_heads, config.head_size))
     out = out.detach().cpu().numpy()
+
+    if config.output_post_softmax_qk >= 0:
+        out_qk_ref = out_qk_post_softmax_ref if config.output_post_softmax_qk == 1 else out_qk_pre_softmax_ref
+        out_qk_ref = out_qk_ref.detach().cpu().numpy()
+
+        for batch_idx in range(config.batch_size):
+            total_seqlen = cache_seqlens[batch_idx] + 1
+            assert numpy.allclose(
+                out_qk[batch_idx, :, :, :total_seqlen],
+                out_qk_ref[batch_idx, :, :, :total_seqlen],
+                rtol=rtol,
+                atol=atol,
+                equal_nan=True,
+            )
 
     # Compare results
     all_close = numpy.allclose(out, out_ref, rtol=rtol, atol=atol, equal_nan=True)
@@ -2152,6 +2336,8 @@ def parity_check_gqa_past_no_buff(
         config.has_position_ids,
         " has_attention_bias:",
         config.has_attention_bias,
+        " output_post_softmax_qk:",
+        config.output_post_softmax_qk,
         " Mean Error:",
         numpy.mean(numpy.abs(out - out_ref)),
         correct,
@@ -2180,7 +2366,16 @@ class TestGQA(unittest.TestCase):
         ]
 
     def run_test_config(
-        self, test_func, config_class, batches, seqs, num_h, h_sizes, pos_ids_attn_bias, additional_params=None
+        self,
+        test_func,
+        config_class,
+        batches,
+        seqs,
+        num_h,
+        h_sizes,
+        pos_ids_attn_bias,
+        output_post_softmax_qk,
+        additional_params=None,
     ):
         if additional_params is None:
             additional_params = {}
@@ -2202,33 +2397,45 @@ class TestGQA(unittest.TestCase):
                                         for softcap in [0.0, 50.0]:
                                             for use_smooth_softmax in [False, True]:
                                                 for has_pos, has_attn in pos_ids_attn_bias:
-                                                    if config_class == PromptConfig:
-                                                        config = config_class(
-                                                            b, s, s2, s + s2 + 8, n, n2, h, has_pos, has_attn
-                                                        )
-                                                    else:  # Config
-                                                        sp = random.randint(1, s2 - s) if s2 - s > 0 else 0
-                                                        config = config_class(b, s, s2, sp, n, n2, h, has_pos, has_attn)
+                                                    for output_qk in output_post_softmax_qk:
+                                                        if config_class == PromptConfig:
+                                                            config = config_class(
+                                                                b,
+                                                                s,
+                                                                s2,
+                                                                s + s2 + 8,
+                                                                n,
+                                                                n2,
+                                                                h,
+                                                                has_pos,
+                                                                has_attn,
+                                                                output_qk,
+                                                            )
+                                                        else:  # Config
+                                                            sp = random.randint(1, s2 - s) if s2 - s > 0 else 0
+                                                            config = config_class(
+                                                                b, s, s2, sp, n, n2, h, has_pos, has_attn, output_qk
+                                                            )
 
-                                                    params = {
-                                                        "config": config,
-                                                        "torch_type": precision["torch_type"],
-                                                        "numpy_type": precision["numpy_type"],
-                                                        "ort_type": precision["ort_type"],
-                                                        "rtol": precision["rtol"],
-                                                        "atol": precision["atol"],
-                                                        "local": local,
-                                                        "past_format": Formats.BNSH,
-                                                        "rotary": rotary,
-                                                        "rotary_interleaved": rotary_interleaved,
-                                                        "packed": packed,
-                                                        "softcap": softcap,
-                                                        "use_smooth_softmax": use_smooth_softmax,
-                                                    }
-                                                    params.update(additional_params)
+                                                        params = {
+                                                            "config": config,
+                                                            "torch_type": precision["torch_type"],
+                                                            "numpy_type": precision["numpy_type"],
+                                                            "ort_type": precision["ort_type"],
+                                                            "rtol": precision["rtol"],
+                                                            "atol": precision["atol"],
+                                                            "local": local,
+                                                            "past_format": Formats.BNSH,
+                                                            "rotary": rotary,
+                                                            "rotary_interleaved": rotary_interleaved,
+                                                            "packed": packed,
+                                                            "softcap": softcap,
+                                                            "use_smooth_softmax": use_smooth_softmax,
+                                                        }
+                                                        params.update(additional_params)
 
-                                                    all_close = test_func(**params)
-                                                    self.assertTrue(all_close)
+                                                        all_close = test_func(**params)
+                                                        self.assertTrue(all_close)
 
     def test_gqa_no_past(self):
         print("-------- TEST GQA NO PAST (PROMPT CASE) ---------")
@@ -2245,12 +2452,29 @@ class TestGQA(unittest.TestCase):
         )
         num_h = [(32, 8)] if pipeline_mode else [(6, 6), (6, 3), (9, 9), (9, 3)]
         h_sizes = [128] if pipeline_mode else [32, 40, 64, 80, 96, 128, 160, 192, 224, 256]
+        output_post_softmax_qk = [-1] if pipeline_mode else [-1, 0, 1]
 
         # Test with buffer
-        self.run_test_config(parity_check_gqa_prompt, PromptConfig, batches, seqs, num_h, h_sizes, pos_ids_attn_bias)
+        self.run_test_config(
+            parity_check_gqa_prompt,
+            PromptConfig,
+            batches,
+            seqs,
+            num_h,
+            h_sizes,
+            pos_ids_attn_bias,
+            output_post_softmax_qk,
+        )
         # Test without buffer
         self.run_test_config(
-            parity_check_gqa_prompt_no_buff, PromptConfig, batches, seqs, num_h, h_sizes, pos_ids_attn_bias
+            parity_check_gqa_prompt_no_buff,
+            PromptConfig,
+            batches,
+            seqs,
+            num_h,
+            h_sizes,
+            pos_ids_attn_bias,
+            output_post_softmax_qk,
         )
 
     def test_gqa_past(self):
@@ -2268,11 +2492,23 @@ class TestGQA(unittest.TestCase):
         )
         num_h = [(9, 3)] if pipeline_mode else [(6, 6), (6, 3), (9, 9), (9, 3)]
         h_sizes = [64] if pipeline_mode else [32, 40, 64, 80, 96, 128, 160, 192, 224, 256]
+        output_post_softmax_qk = [-1] if pipeline_mode else [-1, 0, 1]
 
         # Test with buffer
-        self.run_test_config(parity_check_gqa_past, Config, batches, seqs, num_h, h_sizes, pos_ids_attn_bias)
+        self.run_test_config(
+            parity_check_gqa_past, Config, batches, seqs, num_h, h_sizes, pos_ids_attn_bias, output_post_softmax_qk
+        )
         # Test without buffer
-        self.run_test_config(parity_check_gqa_past_no_buff, Config, batches, seqs, num_h, h_sizes, pos_ids_attn_bias)
+        self.run_test_config(
+            parity_check_gqa_past_no_buff,
+            Config,
+            batches,
+            seqs,
+            num_h,
+            h_sizes,
+            pos_ids_attn_bias,
+            output_post_softmax_qk,
+        )
 
     def test_gqa_interactive_one_batch(self):
         print("-------- TEST GQA INTERACTIVE ---------")
@@ -2287,6 +2523,7 @@ class TestGQA(unittest.TestCase):
             if pipeline_mode
             else [(False, False), (True, True), (False, True), (True, False)]
         )
+        output_post_softmax_qk = [-1, 0, 1]
         num_h = [(32, 8)] if pipeline_mode else [(6, 6), (6, 3), (9, 9), (9, 3)]
         h_sizes = [32] if pipeline_mode else [32, 40, 64, 80, 96, 128, 160, 192, 224, 256]
 
@@ -2299,6 +2536,7 @@ class TestGQA(unittest.TestCase):
             num_h,
             h_sizes,
             pos_ids_attn_bias,
+            output_post_softmax_qk,
             additional_params={"softcap": 0.0, "use_smooth_softmax": False},
         )
         self.run_test_config(
@@ -2309,6 +2547,7 @@ class TestGQA(unittest.TestCase):
             num_h,
             h_sizes,
             pos_ids_attn_bias,
+            output_post_softmax_qk,
             additional_params={"softcap": 0.0, "use_smooth_softmax": False},
         )
 
