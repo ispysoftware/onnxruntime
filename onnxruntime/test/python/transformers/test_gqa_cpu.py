@@ -1141,8 +1141,10 @@ def attention_ref(
         scores = scores / softcap
         scores = scores.tanh()
         scores = scores * softcap
+    masked_scores = scores.clone()
     if key_padding_mask is not None:
         scores.masked_fill_(rearrange(~key_padding_mask, "b s -> b 1 1 s"), float("-inf"))
+        masked_scores.masked_fill_(rearrange(~key_padding_mask, "b s -> b 1 1 s"), 0)
     if window_size[0] >= 0 or window_size[1] >= 0:
         local_mask = construct_local_mask(
             seqlen_q,
@@ -1152,7 +1154,6 @@ def attention_ref(
             key_padding_mask,
             q.device,
         )
-        masked_scores = scores.clone()
         masked_scores.masked_fill_(local_mask, 0.0)
         scores.masked_fill_(local_mask, float("-inf"))
 
