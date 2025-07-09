@@ -108,6 +108,10 @@
     {
       "name": "flatbuffers",
       "version": "23.5.26"
+    },
+    {
+      "name": "duktape",
+      "version": "2.7.0#2"
     }
   ]
 }
