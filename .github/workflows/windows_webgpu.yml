@@ -155,6 +155,29 @@ jobs:
         working-directory: ${{ github.workspace }}\csharp
         continue-on-error: true
 
+      # This step uses the same build directory as the previous build step, to accelerate the build process.
+      - name: Build and Test dynamic WGSL template
+        shell: pwsh
+        run: |
+          python.exe ${{ github.workspace }}\tools\ci_build\build.py `
+            --config RelWithDebInfo `
+            --build_dir ${{ github.workspace }} `
+            --skip_submodule_sync `
+            --parallel `
+            --use_binskim_compliant_compile_flags `
+            --cmake_generator "Visual Studio 17 2022" `
+            --build_shared_lib `
+            --use_webgpu `
+            --wgsl_template dynamic `
+            ${{ matrix.vcpkg_option == 'vcpkg' && '--use_vcpkg' || '' }} `
+            --cmake_extra_defines `
+            onnxruntime_BUILD_UNIT_TESTS=ON `
+            onnxruntime_BUILD_DAWN_MONOLITHIC_LIBRARY=ON
+          if ($lastExitCode -ne 0) {
+            exit $lastExitCode
+          }
+          Remove-Item "${{ github.workspace }}\RelWithDebInfo" -Include "*.obj" -Recurse
+
   webgpu_external_dawn_build_x64_RelWithDebInfo:
     runs-on: ["self-hosted", "1ES.Pool=onnxruntime-github-Win2022-GPU-A10"]
     timeout-minutes: 300
